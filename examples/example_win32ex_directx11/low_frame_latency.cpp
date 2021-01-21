@@ -7,10 +7,12 @@
 #include <atomic>
 #include <functional>
 #include <vector>
+#include <unordered_map>
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
+#include "imgui_freetype.h"
 #include <Windows.h>
 #include <wrl.h>
 #include <dxgi1_6.h>
@@ -37,6 +39,146 @@ static bool                 g_bWantUpdateWindowSize = false;
 static UINT                 g_uWindowWidth          = 1;
 static UINT                 g_uWindowHeight         = 1;
 static std::recursive_mutex g_xWindowSizeLock;
+
+#include <imm.h>
+#pragma comment(lib, "imm32.lib")
+class InputMethodHelper
+{
+private:
+    typedef HIMC (WINAPI *PFN_ImmGetContext)(HWND);
+    typedef BOOL (WINAPI *PFN_ImmReleaseContext)(HWND, HIMC);
+    typedef BOOL (WINAPI *PFN_ImmSetOpenStatus)(HIMC, BOOL);
+    typedef BOOL (WINAPI *PFN_ImmGetOpenStatus)(HIMC);
+    typedef BOOL (WINAPI *PFN_ImmSetConversionStatus)(HIMC, DWORD, DWORD);
+    typedef BOOL (WINAPI *PFN_ImmNotifyIME)(HIMC, DWORD, DWORD, DWORD);
+    static constexpr int IME_CMODE = IME_CMODE_FIXED | IME_CMODE_NOCONVERSION;
+private:
+    HMODULE                    Imm32                  = NULL;
+    PFN_ImmGetContext          ImmGetContext          = NULL;
+    PFN_ImmReleaseContext      ImmReleaseContext      = NULL;
+    PFN_ImmSetOpenStatus       ImmSetOpenStatus       = NULL;
+    PFN_ImmGetOpenStatus       ImmGetOpenStatus       = NULL;
+    PFN_ImmSetConversionStatus ImmSetConversionStatus = NULL;
+    PFN_ImmNotifyIME           ImmNotifyIME           = NULL;
+    std::unordered_map<HWND, bool> enable_map;
+public:
+    static LRESULT MessageCallback(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+    {
+        //if (msg == WM_IME_NOTIFY && wParam == IMN_SETCONVERSIONMODE)
+        {
+            auto& cls = InputMethodHelper::get();
+            auto it = cls.enable_map.find(hWnd);
+            if (it != cls.enable_map.end())
+            {
+                if (!it->second)
+                {
+                    HIMC imc = cls.ImmGetContext(hWnd);
+                    if (imc)
+                    {
+                        cls.ImmSetConversionStatus(imc, IME_CMODE, IME_SMODE_NONE);
+                        cls.ImmSetOpenStatus(imc, FALSE);
+                        cls.ImmReleaseContext(hWnd, imc);
+                    }
+                }
+            }
+        }
+        return 0;
+    };
+public:
+    bool enable(HWND window, bool be)
+    {
+        if (enable_map.find(window) != enable_map.end())
+        {
+            enable_map[window] = be;
+        }
+        else
+        {
+            enable_map.emplace(std::make_pair(window, be));
+        }
+        if (ImmGetContext && ImmReleaseContext && ImmSetOpenStatus)
+        {
+            HIMC imc = ImmGetContext(window);
+            if (imc)
+            {
+                if (ImmSetConversionStatus && !be)
+                {
+                    ImmSetConversionStatus(imc, IME_CMODE, IME_SMODE_NONE);
+                }
+                BOOL b = ImmSetOpenStatus(imc, be ? TRUE : FALSE);
+                ImmReleaseContext(window, imc);
+                return b != FALSE;
+            }
+        }
+        return false;
+    };
+    bool seteng(HWND window)
+    {
+        if (ImmGetContext && ImmReleaseContext && ImmSetConversionStatus)
+        {
+            HIMC imc = ImmGetContext(window);
+            if (imc)
+            {
+                if (ImmSetOpenStatus)
+                {
+                    ImmSetOpenStatus(imc, FALSE);
+                }
+                BOOL b = ImmSetConversionStatus(imc, IME_CMODE, IME_SMODE_NONE);
+                ImmReleaseContext(window, imc);
+                return b != FALSE;
+            }
+        }
+        return false;
+    };
+    bool status(HWND window)
+    {
+        auto it = enable_map.find(window);
+        if (it != enable_map.end())
+        {
+            return it->second;
+        }
+        HIMC imc = ImmGetContext(window);
+        if (imc)
+        {
+            BOOL b = ImmGetOpenStatus(imc);
+            ImmReleaseContext(window, imc);
+            return b != FALSE;
+        }
+        return false;
+    };
+public:
+    InputMethodHelper()
+    {
+        Imm32 = ::LoadLibraryA("Imm32.dll");
+        if (Imm32)
+        {
+            ImmGetContext           = (PFN_ImmGetContext         )::GetProcAddress(Imm32, "ImmGetContext"         );
+            ImmReleaseContext       = (PFN_ImmReleaseContext     )::GetProcAddress(Imm32, "ImmReleaseContext"     );
+            ImmSetOpenStatus        = (PFN_ImmSetOpenStatus      )::GetProcAddress(Imm32, "ImmSetOpenStatus"      );
+            ImmGetOpenStatus        = (PFN_ImmGetOpenStatus      )::GetProcAddress(Imm32, "ImmGetOpenStatus"      );
+            ImmSetConversionStatus  = (PFN_ImmSetConversionStatus)::GetProcAddress(Imm32, "ImmSetConversionStatus");
+            ImmNotifyIME            = (PFN_ImmNotifyIME          )::GetProcAddress(Imm32, "ImmNotifyIME"          );
+        }
+    };
+    ~InputMethodHelper()
+    {
+        Imm32                  = NULL;
+        ImmGetContext          = NULL;
+        ImmReleaseContext      = NULL;
+        ImmSetOpenStatus       = NULL;
+        ImmGetOpenStatus       = NULL;
+        ImmSetConversionStatus = NULL;
+        ImmNotifyIME           = NULL;
+        if (Imm32)
+            ::FreeLibrary(Imm32);
+        Imm32 = NULL;
+    };
+public:
+    static InputMethodHelper& get()
+    {
+        static InputMethodHelper instance;
+        return instance;
+    };
+};
 
 class Application
 {
@@ -613,6 +755,7 @@ public:
 void WorkingThread()
 {
     auto& app = Application::get();
+    auto& imm = InputMethodHelper::get();
     
     // Initialize Direct3D
     if (!app.createGraphic())
@@ -651,6 +794,8 @@ void WorkingThread()
     //io.Fonts->AddFontFromFileTTF("../../misc/fonts/ProggyTiny.ttf", 10.0f);
     //ImFont* font = io.Fonts->AddFontFromFileTTF("c:\\Windows\\Fonts\\ArialUni.ttf", 18.0f, NULL, io.Fonts->GetGlyphRangesJapanese());
     //IM_ASSERT(font != NULL);
+    io.Fonts->AddFontFromFileTTF("c:\\Windows\\Fonts\\msyh.ttc", 16.0f * ImGui_ImplWin32_GetDpiScaleForHwnd(app.windowHandle), NULL, io.Fonts->GetGlyphRangesChineseFull());
+    ImGuiFreeType::BuildFontAtlas(io.Fonts);
     
     // Our state
     bool show_demo_window = true;
@@ -737,6 +882,20 @@ void WorkingThread()
             if (ImGui::Button("Button")) counter++;                 // Buttons return true when clicked (most widgets return true when edited/activated)
             ImGui::SameLine();
             ImGui::Text("counter = %d", counter);
+            
+            bool ime_status = imm.status(app.windowHandle);
+            ImGui::Text("IME %s", ime_status ? "Enable" : "Disable");
+            ImGui::SameLine();
+            if (ImGui::Button("Disable IME")) imm.enable(app.windowHandle, false);
+            ImGui::SameLine();
+            if (ImGui::Button("Enable IME")) imm.enable(app.windowHandle, true);
+            ImGui::SameLine();
+            if (ImGui::Button("Set IME EN")) imm.seteng(app.windowHandle);
+            
+            static HIMC _oldhimc = NULL;
+            
+            if (ImGui::Button("Associate NULL")) _oldhimc = ::ImmAssociateContext(app.windowHandle, _oldhimc);
+            if (ImGui::Button("Associate Back")) _oldhimc = ::ImmAssociateContext(app.windowHandle, _oldhimc);
             
             ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
             ImGui::End();
@@ -833,14 +992,17 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT uMs
 
 int main(int, char**)
 {
+    ImGui_ImplWin32_EnableDpiAwareness();
     auto& app = Application::get();
     app.addWindowMessageCallback(&WorkingThreadMessageCallback);
     app.addWindowMessageCallback(&ImGui_ImplWin32_WndProcHandler);
+    app.addWindowMessageCallback(&InputMethodHelper::MessageCallback);
     if (app.createWindow(1280, 720, L"Dear ImGui Win32EX Direct3D11 Example"))
     {
         WorkingThread();
     }
     app.destroyWindow();
+    app.removeWindowMessageCallback(&InputMethodHelper::MessageCallback);
     app.removeWindowMessageCallback(&ImGui_ImplWin32_WndProcHandler);
     app.removeWindowMessageCallback(&WorkingThreadMessageCallback);
     return 0;
